@@ -1,8 +1,8 @@
 """
-app.py V4.2 - PRODUCTION + SQLite CLV + Telegram Alerts - FINAL
+app.py V4.3 - PRODUCTION + SQLite CLV + Telegram Alerts + TEST + /start - FINAL
 BeastEngineFBBot | ID: 1243807983
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -15,7 +15,7 @@ from match import (
     calculate_clv
 )
 
-app = FastAPI(title="BEAST V4.2 PRODUCTION", version="4.2")
+app = FastAPI(title="BEAST V4.3 PRODUCTION", version="4.3")
 
 # ================= CONFIG - FINAL =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8707617926:AAGDPDaQ2QiQEhnLXAFuh4QL10jSfSYIApM")
@@ -23,6 +23,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1243807983")
 DB_PATH = "beast_clv.db"
 MIN_EV_ALERT = 8.0
 MIN_CONF_ALERT = 0.70
+# Change this to your Render URL!
+RENDER_URL = os.getenv("RENDER_URL", "https://beastengine.onrender.com")
 
 # ================= SQLITE INIT =================
 def init_db():
@@ -72,6 +74,14 @@ async def send_telegram(msg):
             await client.post(url, json={"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"Markdown"})
     except Exception as e: print(f"Telegram error: {e}")
 
+async def reply_telegram(chat_id, msg):
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            await client.post(url, json={"chat_id":chat_id,"text":msg,"parse_mode":"Markdown"})
+    except Exception as e: print(f"Reply error: {e}")
+
 def format_alert(bets):
     txt=f"🔥 BEAST V4.2 ALERT - {len(bets)} VALUE BETS 🔥\n\n"
     for i,b in enumerate(bets[:5],1):
@@ -100,8 +110,40 @@ LAST_SCAN = {}; LAST_TOP_BETS = []
 
 @app.get("/")
 def root():
-    return {"engine":"BEAST V4.2 PRODUCTION","markets":len(ALL_MARKETS),"leagues":len(LEAGUE_CONFIG),"clv":get_clv_report_sql(),"status":"ONLINE","bot":"@BeastEngineFBBot"}
+    return {"engine":"BEAST V4.3 PRODUCTION","markets":len(ALL_MARKETS),"leagues":len(LEAGUE_CONFIG),"clv":get_clv_report_sql(),"status":"ONLINE","bot":"@BeastEngineFBBot"}
 
+# ================= NEW TEST ROUTES - ADDED =================
+@app.get("/test")
+async def test_alert():
+    msg = "🔥 BEAST TEST ALERT - IT'S WORKING BABA! ✅\n\n⚽ Man City vs Arsenal\n🎯 Correct Score: 2-1\n📊 Confidence: 87%\n💰 Odds: 8.50\n📈 EV: +12.3%\n\nYour Football Beast Engine is LIVE and pushing to Telegram!\nbeastengine.onrender.com"
+    await send_telegram(msg)
+    return {"status": "Test sent to Telegram!", "bot": "@BeastEngineFBBot"}
+
+@app.get("/set-webhook")
+async def set_webhook():
+    import httpx
+    webhook_url = f"{RENDER_URL}/webhook"
+    async with httpx.AsyncClient() as client:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        r = await client.post(url, json={"url": webhook_url})
+        return {"webhook_url": webhook_url, "telegram_response": r.json()}
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    print(f"Webhook data: {data}")
+    if "message" in data:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"].get("text", "")
+        if text == "/start":
+            welcome = "👑 Welcome Baba! BEAST ENGINE V4.3 ONLINE!\n\n⚽ Football Beast Scanning:\n✅ 5 Leagues (Premier, La Liga, Bundesliga, Serie A, Ligue 1)\n✅ 10 Markets\n✅ EV > 8% | Conf > 70%\n\nYou go receive alert when correct score enter!\n\nCommands:\n/test - Test bot\n/clv - Check CLV report\n\nEngine: beastengine.onrender.com\nStatus: ONLINE 🔥"
+            await reply_telegram(chat_id, welcome)
+        elif text == "/clv":
+            report = get_clv_report_sql()
+            await reply_telegram(chat_id, f"📊 CLV REPORT:\n{json.dumps(report, indent=2)}")
+    return {"ok": True}
+
+# ================= EXISTING ROUTES =================
 @app.post("/scan")
 async def scan(data: BatchInput, mode: str="prematch", alert: bool=True):
     odds_list=[o.dict() for o in data.odds]
