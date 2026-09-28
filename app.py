@@ -19,7 +19,7 @@ from match import (
 app = FastAPI(title="BEAST V4.4 PRODUCTION + SCANNER", version="4.4")
 
 # ================= CONFIG - NO HARDCODE! =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8714738524:AAGkBY6TBYsZUVwlHo6Ygy-7X6Av8tIomuQ")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1243807983")
 DB_PATH = "beast_clv.db"
 MIN_EV_ALERT = 8.0
