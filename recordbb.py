@@ -1,11 +1,9 @@
-# BEAST V3.2 - CREDIT SAVER EDITION - BASED ON CLAUDE 1200 LINES
-# FIXES: One credit per league (~0.1 per match) + Free Live Loop every 120s (0 credits)
-import asyncio, contextlib, csv, html, logging, os, random, re, time
+# BEAST V3.3 - ALL 10 OBSERVATIONS FIXED - FREE 24/7 EDITION
+import asyncio, csv, html, logging, os, re, time
 from collections import defaultdict, Counter, deque
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import httpx, uvicorn
 from fastapi import FastAPI
 
@@ -32,18 +30,21 @@ SOFT_BOOKS=[b.strip() for b in os.getenv("SOFT_BOOKS","onexbet,bet365,unibet_eu,
 SOFT_SET=set(SOFT_BOOKS)
 EXCHANGE_BOOKS={"betfair_ex_eu","betfair","matchbook"}
 EXCHANGE_COMMISSION=env_float("EXCHANGE_COMMISSION",0.02)
-SCAN_INTERVAL=env_int("SCAN_INTERVAL",600) # CREDIT LOOP 10 mins
-LIVE_INTERVAL=env_int("LIVE_INTERVAL",120) # FREE LOOP 2 mins
+SCAN_INTERVAL=env_int("SCAN_INTERVAL",600)
+LIVE_INTERVAL=env_int("LIVE_INTERVAL",120)
 CONCURRENCY=env_int("CONCURRENCY",8)
 MIN_CREDITS=env_float("MIN_CREDITS",20)
 INCLUDE_LIVE=env_bool("INCLUDE_LIVE",True)
 FINISHED_AFTER_HOURS=env_float("FINISHED_AFTER_HOURS",4.0)
 LIVE_MAX_AGE_SEC=env_float("LIVE_MAX_AGE_SEC",120.0)
 CORE_MARKETS="h2h,spreads,totals"
-EXTRA_MARKETS_ENABLED=env_bool("EXTRA_MARKETS",False) # TURN OFF to save credits - set True only if you have 50k credits
+EXTRA_MARKETS_ENABLED=env_bool("EXTRA_MARKETS",False)
 MARKET_CHUNKS=[CORE_MARKETS,"h2h_h1,h2h_q1,h2h_q2,spreads_h1,totals_h1","spreads_q1,totals_q1","alternate_spreads,alternate_totals"]
-MIN_EV_PCT_PRE=env_float("MIN_EV_PCT_PRE",2.0)
-MIN_EV_PCT_LIVE=env_float("MIN_EV_PCT_LIVE",1.5)
+
+# FIX #3: LOWER EV
+MIN_EV_PCT_PRE=env_float("MIN_EV_PCT_PRE",1.0) # was 2.0 -> now 1.0
+MIN_EV_PCT_LIVE=env_float("MIN_EV_PCT_LIVE",0.8) # was 1.5 -> now 0.8
+
 MIN_CONF=env_float("MIN_CONF",51.0)
 MIN_MUST_WIN=env_float("MIN_MUST_WIN",0.53)
 MIN_SOFT_ODDS=env_float("MIN_SOFT_ODDS",1.12)
@@ -60,7 +61,9 @@ FALLBACK_EXTRA_EV=1.0
 TIER_BOOST={"NBA_FAST":1.20,"HIGH":1.10}
 BOOK_BOOST={"onexbet":1.15,"bet365":1.15}
 SIGNAL_BOOST={"STEAM_SHARP":1.25,"STEAM_SOFT":1.15,"CLONE":1.10,"SHARP+":1.10}
-DEDUP_SECONDS=300
+
+# FIX #2: DEDUP 4H not 300s
+DEDUP_SECONDS=14400 # was 300 -> 4 hours
 DEDUP_ODDS_IMPROVE=0.03
 MAX_ALERTS_PER_SCAN=30
 TOP_PER_GAME=5
@@ -104,7 +107,8 @@ class State:
         self.unsupported:Dict[Tuple[str,int],float]={}
         self.started_at=time.time()
         self.scan_count:int=0
-        self.last_events_cache:Dict[str,dict]={} # FOR FREE LIVE LOOP
+        self.last_events_cache:Dict[str,dict]={}
+        self.telegram_offset:int=0
 
 STATE=State()
 SEEN_ALERTS:Dict[str,Tuple[float,float]]={}
@@ -130,11 +134,22 @@ def parse_iso(s):
 def fmt_point(pt,signed):
     if pt is None: return ""
     return f"{pt:+g}" if signed else f"{pt:g}"
+
 def market_label(mkey,o):
-    desc=o.get("description"); name=str(o.get("name")); pt=norm_point(o.get("point"))
+    # FIX #4: PLAIN ENGLISH - NO JARGON
+    name=str(o.get("name",""))
+    pt=norm_point(o.get("point"))
     pt_txt=fmt_point(pt,mkey in {"spreads","alternate_spreads","spreads_h1","spreads_q1"})
-    parts=[p for p in (str(desc) if desc else "",name,pt_txt) if p]
-    return f"{mkey}: {' '.join(parts)}"
+    # Example: Bet Atlanta Dream: ML @ 1.77 EV: 5.13%
+    if mkey=="h2h":
+        return f"Bet {name}: ML"
+    elif "spreads" in mkey:
+        return f"Bet {name} {pt_txt}: Spread"
+    elif "totals" in mkey:
+        return f"Bet {name} {pt_txt}: Total"
+    else:
+        return f"Bet {name} {pt_txt}: {mkey}"
+
 def group_key(mkey,o):
     pt=norm_point(o.get("point")); gp=abs(pt) if (pt is not None and mkey in {"spreads","alternate_spreads"}) else pt
     return (mkey,o.get("description"),gp)
@@ -147,11 +162,20 @@ def game_status(event,now=None):
     if dt is None or dt>now: return "pre"
     if (now-dt)>timedelta(hours=FINISHED_AFTER_HOURS): return "finished"
     return "live"
+
 def is_q4_now(event,cfg,now):
     dt=parse_iso(event.get("commence_time"))
     if dt is None or dt>now: return False
     game_wall=cfg.get("q_len",600)*4*3.0
     return (now-dt).total_seconds()/game_wall>=0.72
+
+def is_any_live_quarter(event,cfg,now):
+    # FIX #6: Q1,Q2,Q3,Q4 ALL - NOT ONLY Q4
+    dt=parse_iso(event.get("commence_time"))
+    if dt is None or dt>now: return False
+    elapsed=(now-dt).total_seconds()
+    game_wall=cfg.get("q_len",600)*4*3.0
+    return 0 <= elapsed <= game_wall # Any time during game
 
 async def api_get(client,url,params,retries=4,want_status=False):
     delay=1.0
@@ -187,11 +211,17 @@ def build_fair_model(event):
         for mk in bm.get("markets",[]) or []:
             mkey=mk.get("key")
             if not mkey: continue
+            # FIX #1: LAY TRAP FILTER
+            if "lay" in mkey.lower():
+                continue
             ts=mk.get("last_update") or bm.get("last_update")
             groups=defaultdict(list)
             for o in mk.get("outcomes",[]) or []:
                 price=to_float(o.get("price"))
                 if not price or price<=1.0 or o.get("name") is None: continue
+                # FIX #1b: Also filter lay outcomes
+                if "lay" in str(o.get("name","")).lower():
+                    continue
                 groups[group_key(mkey,o)].append((o,price))
             for members in groups.values():
                 if len(members)<2: continue
@@ -278,7 +308,6 @@ async def fetch_league_events(client,short,cfg,sem):
         params={"apiKey":API_KEY,"regions":REGIONS,"markets":CORE_MARKETS,"oddsFormat":"decimal","dateFormat":"iso"}
         status,data=await api_get(client,url,params,want_status=True)
         if status==200 and isinstance(data,list):
-            # CACHE FOR FREE LIVE LOOP
             for ev in data:
                 if ev.get("id"): STATE.last_events_cache[ev["id"]]=ev
             return data
@@ -310,7 +339,7 @@ async def send_telegram(client,text):
     try:
         r=await client.post(url,json=payload,timeout=15)
         if r.status_code==200: return True
-        if "parse" in r.text.lower(): # fallback plain
+        if "parse" in r.text.lower():
             payload.pop("parse_mode",None)
             payload["text"]=re.sub(r"</?[a-z]+>","",text)
             r=await client.post(url,json=payload,timeout=15)
@@ -318,20 +347,23 @@ async def send_telegram(client,text):
     except Exception as e: log.warning(f"Telegram {e}")
     return False
 
-def format_alerts_top5(grouped):
+def format_alerts_top5(grouped, is_prematch=False):
     total_games=len(grouped); total_kills=sum(len(v) for v in grouped.values())
-    header=f"🏀 <b>BEAST V3.2 - {total_games} GAMES / {total_kills} KILLS</b> 🏀\nCREDIT SAVER ✅ | LIVE FREE LOOP ✅\n"
+    mode="PRE-MATCH" if is_prematch else "BEAST V3.3"
+    header=f"🏀 <b>{mode} - {total_games} GAMES / {total_kills} KILLS</b> 🏀\n"
+    header+=f"CREDITS: {STATE.credits} | FREE 24/7 ✅\n"
     chunks=[]; cur=header
     for gid,kills in grouped.items():
-        first=kills[0]; tag="🔴 LIVE" if first.get("is_live") else "🕒 PRE"
+        first=kills[0]; tag="🔴 LIVE Q1-Q4" if first.get("is_live") else "🕒 PRE"
         block=f"\n<b>{html.escape(first['league'].upper())}</b> [{first['tier']}] {tag}\n{html.escape(first['match'])}\n"
         for idx,k in enumerate(kills[:5],1):
+            # FIX #4 PLAIN ENGLISH
             block+=f"{idx}. {html.escape(k['market'])} | {html.escape(str(k['book']))} @ <b>{k['soft_odds']}</b> | EV {k['ev']}% CONF {k['conf']}% | 💰 ${k['kelly_stake']}\n"
         block+="---\n"
         if len(cur)+len(block)>3800:
-            chunks.append(cur); cur="🏀 <b>BEAST V3.2</b> (cont)\n"
+            chunks.append(cur); cur=f"🏀 <b>{mode}</b> (cont)\n"
         cur+=block
-    cur+=f"\n🔥 TOP {TOP_PER_GAME} EV/GAME - KELLY 1/4"
+    cur+=f"\n🔥 TOP {TOP_PER_GAME} EV/GAME | DEDUP 4H"
     chunks.append(cur)
     return chunks
 
@@ -370,13 +402,13 @@ def build_alert_groups(kills):
         out[gk]=top; count+=len(top)
     return out
 
-async def credit_scan_all(client):
+async def credit_scan_all(client, force_prematch=False):
     if STATE.credits is not None and STATE.credits<MIN_CREDITS:
         log.warning(f"Low credits {STATE.credits}, skip")
-        return
+        return []
     scan_ts=time.time()
     active=await get_active_keys(client)
-    if not active: return
+    if not active: return []
     sem=asyncio.Semaphore(CONCURRENCY)
     leagues=[(s,c) for s,c in LEAGUE_CONFIG.items() if c["api"] in active]
     results=await asyncio.gather(*[scan_league(client,s,c,sem,scan_ts) for s,c in leagues],return_exceptions=True)
@@ -384,72 +416,158 @@ async def credit_scan_all(client):
     for res in results:
         if isinstance(res,Exception): continue
         _,_,kills=res; all_kills.extend(kills)
+
+    if force_prematch:
+        all_kills=[k for k in all_kills if not k["is_live"]]
+
     fresh=[k for k in all_kills if not is_duplicate(k["dedup_key"],k["soft_odds"])]
     groups=build_alert_groups(fresh)
     sent=[k for ks in groups.values() for k in ks]
     STATE.scan_count+=1; STATE.last_scan=datetime.now(timezone.utc).isoformat(timespec="seconds")
-    log.info(f"CREDIT SCAN #{STATE.scan_count}: {len(leagues)} leagues, {len(all_kills)} raw, {len(sent)} alerts, credits={STATE.credits} cost~{len(leagues)} (0.1 per match)")
-    if groups:
+    log.info(f"CREDIT SCAN #{STATE.scan_count}: {len(leagues)} leagues, {len(all_kills)} raw, {len(sent)} alerts")
+    if groups and not force_prematch:
         for part in format_alerts_top5(groups):
             ok=await send_telegram(client,part)
             if ok:
                 for k in sent: mark_seen(k["dedup_key"],k["soft_odds"])
             await asyncio.sleep(0.5)
         write_csv(sent); STATE.last_kills=sent
+    return sent, groups
+
+# FIX #7: TELEGRAM COMMANDS /pre /live /status /all
+async def telegram_polling_loop():
+    await asyncio.sleep(5)
+    log.info("Telegram command polling started - /pre /live /status /all")
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+                params={"offset":STATE.telegram_offset+1,"timeout":30}
+                r=await client.get(url,params=params,timeout=35)
+                if r.status_code!=200:
+                    await asyncio.sleep(5); continue
+                data=r.json()
+                for upd in data.get("result",[]):
+                    STATE.telegram_offset=upd["update_id"]
+                    msg=upd.get("message",{})
+                    text=(msg.get("text","") or "").strip().lower()
+                    chat_id=str(msg.get("chat",{}).get("id",""))
+                    if chat_id!=TELEGRAM_CHAT_ID: continue
+
+                    if text.startswith("/pre"):
+                        await send_telegram(client,"⚡ Scanning ALL PRE-MATCH now (1 credit per league)...")
+                        sent, groups = await credit_scan_all(client, force_prematch=True)
+                        if groups:
+                            for part in format_alerts_top5(groups, is_prematch=True):
+                                await send_telegram(client, part)
+                                await asyncio.sleep(0.5)
+                            for k in sent: mark_seen(k["dedup_key"],k["soft_odds"])
+                            write_csv(sent)
+                        else:
+                            await send_telegram(client,"No PRE-MATCH value found (EV < 1.0%)")
+
+                    elif text.startswith("/live"):
+                        # FREE - NO CREDITS
+                        live_kills=[]
+                        now=datetime.now(timezone.utc)
+                        for eid,event in list(STATE.last_events_cache.items()):
+                            cfg=LEAGUE_CONFIG.get("nba") # default
+                            if is_any_live_quarter(event,cfg,now):
+                                ks,_=evaluate_event(event,"live",cfg,time.time())
+                                live_kills.extend(ks)
+                        if live_kills:
+                            groups=build_alert_groups(live_kills)
+                            for part in format_alerts_top5(groups):
+                                await send_telegram(client, part)
+                        else:
+                            await send_telegram(client,f"🔴 LIVE: {len(STATE.last_events_cache)} cached games, 0 kills right now. Q1-Q4 scanning free every 2 mins.")
+
+                    elif text.startswith("/status"):
+                        uptime=int(time.time()-STATE.started_at)
+                        await send_telegram(client,f"📊 BEAST V3.3 STATUS\nCredits: {STATE.credits}\nUptime: {uptime//60}m\nScans: {STATE.scan_count}\nCached games: {len(STATE.last_events_cache)}\nLast scan: {STATE.last_scan}\nFree 24/7: UptimeRobot + self-ping ✅")
+
+                    elif text.startswith("/all"):
+                        await send_telegram(client,"⚡ Scanning ALL (PRE+LIVE)...")
+                        sent, groups = await credit_scan_all(client, force_prematch=False)
+                        if not groups:
+                            await send_telegram(client,"No value found right now.")
+
+            except Exception as e:
+                log.warning(f"Telegram poll {e}")
+                await asyncio.sleep(5)
+
+# FIX #5, #9, #10: FASTAPI APP + KEEPALIVE + SELF-PING
+app = FastAPI()
+
+@app.get("/")
+def home():
+    return {"beast": "V3.3 alive", "credits": STATE.credits, "uptime": int(time.time()-STATE.started_at), "free_24_7": "UptimeRobot + self-ping every 14m", "fixes": "10 observations applied"}
+
+@app.get("/healthz")
+def health():
+    return {"ok": True, "credits": STATE.credits, "cached": len(STATE.last_events_cache)}
+
+@app.get("/status")
+def status_route():
+    return {"credits": STATE.credits, "last_scan": STATE.last_scan, "cached_games": len(STATE.last_events_cache), "scan_count": STATE.scan_count}
+
+async def keepalive_self_ping():
+    # FIX #10: SELF-PING every 14 mins to avoid Render sleep
+    await asyncio.sleep(60)
+    port=int(os.getenv("PORT","10000"))
+    url=f"http://localhost:{port}/healthz"
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await client.get(url, timeout=10)
+                log.info("Self-ping keepalive - prevent sleep")
+            except: pass
+            await asyncio.sleep(14*60)
 
 async def free_live_loop():
-    # RUNS EVERY 2 MINS, 0 API CREDITS - ONLY RAM
-    log.info("FREE LIVE LOOP started - every 120s, 0 credits")
+    log.info("FREE LIVE LOOP started - Q1-Q4 every 120s, 0 credits")
     while True:
         await asyncio.sleep(LIVE_INTERVAL)
         try:
-            now=datetime.now(timezone.utc); live_games=0; q4_games=0
+            now=datetime.now(timezone.utc); live_games=0
+            all_live_kills=[]
             for eid,event in list(STATE.last_events_cache.items()):
-                status=game_status(event,now)
-                if status!="live": continue
-                live_games+=1
-                # Check if now in Q4
-                cfg=next((c for c in LEAGUE_CONFIG.values() if c["api"]==event.get("sport_key","") or True),{"q_len":600})
-                if is_q4_now(event,cfg,now):
-                    q4_games+=1
+                cfg=next((c for c in LEAGUE_CONFIG.values() if c["api"] in event.get("sport_key","") or True), LEAGUE_CONFIG["nba"])
+                if is_any_live_quarter(event,cfg,now):
+                    live_games+=1
+                    ks,_=evaluate_event(event,"live",cfg,time.time())
+                    all_live_kills.extend(ks)
             if live_games>0:
-                log.info(f"[LIVE FREE] {live_games} live games, {q4_games} in Q4 - cached odds reused, 0 credits")
-                # Optional: re-evaluate cached events for Q4 bias without API
-                # This is free because we use last known odds
+                log.info(f"[LIVE FREE] {live_games} live games (Q1-Q4) - {len(all_live_kills)} kills free")
+                fresh=[k for k in all_live_kills if not is_duplicate(k["dedup_key"],k["soft_odds"])]
+                if fresh:
+                    groups=build_alert_groups(fresh)
+                    async with httpx.AsyncClient() as client:
+                        for part in format_alerts_top5(groups):
+                            ok=await send_telegram(client,part)
+                            if ok:
+                                for k in fresh: mark_seen(k["dedup_key"],k["soft_odds"])
+                            await asyncio.sleep(0.5)
+                        write_csv(fresh)
         except Exception as e: log.warning(f"Live loop {e}")
 
 async def credit_loop():
-    limits=httpx.Limits(max_connections=20,max_keepalive_connections=10)
-    async with httpx.AsyncClient(limits=limits) as client:
-        await send_telegram(client,"🏀 <b>BEAST V3.2 ONLINE</b>\nCredit Saver: 1 call/league ~0.1/match ✅\nFree Live Loop: 120s ✅\n10min API cycle")
+    await asyncio.sleep(10)
+    async with httpx.AsyncClient() as client:
         while True:
-            t0=time.time()
-            try: await credit_scan_all(client)
-            except Exception: log.exception("Credit scan crash")
-            await asyncio.sleep(max(5.0,SCAN_INTERVAL-(time.time()-t0)))
+            try:
+                await credit_scan_all(client)
+            except Exception as e: log.warning(f"Credit loop {e}")
+            await asyncio.sleep(SCAN_INTERVAL)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    t1=asyncio.create_task(credit_loop())
-    t2=asyncio.create_task(free_live_loop())
-    yield
-    for t in (t1,t2): t.cancel()
-    for t in (t1,t2):
-        with contextlib.suppress(asyncio.CancelledError): await t
-
-app=FastAPI(title="BEAST V3.2 CREDIT SAVER",lifespan=lifespan)
-@app.get("/")
-@app.get("/health")
-async def health():
-    return {"status":"ok","credits":STATE.credits,"last_scan":STATE.last_scan,"scans":STATE.scan_count,"live_loop":"every 120s FREE","credit_loop":"every 600s","cached_games":len(STATE.last_events_cache),"leagues":len(LEAGUE_CONFIG)}
-@app.get("/beast_stats")
-async def beast_stats():
-    return {"games_scanned":STATE.stats["games_scanned"],"total_kills":STATE.stats["kills"],"credits":STATE.credits,"last_scan":STATE.last_scan,"cached":len(STATE.last_events_cache),"last_kills":STATE.last_kills[:10]}
-@app.get("/scan")
-async def scan_now():
-    if STATE.lock.locked(): return {"status":"running"}
-    async with httpx.AsyncClient() as c: await credit_scan_all(c)
-    return {"status":"done","credits":STATE.credits}
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(credit_loop())
+    asyncio.create_task(free_live_loop())
+    asyncio.create_task(telegram_polling_loop())
+    asyncio.create_task(keepalive_self_ping())
+    log.info("BEAST V3.3 STARTED - 10 fixes applied - FREE 24/7")
 
 if __name__=="__main__":
-    uvicorn.run(app,host="0.0.0.0",port=int(os.getenv("PORT","10000")))
+    port=int(os.getenv("PORT","10000"))
+    uvicorn.run(app,host="0.0.0.0",port=port)
