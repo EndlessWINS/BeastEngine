@@ -38,10 +38,10 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 # ========= CONFIG =========
-API_KEY = os.getenv("THEODDS_API_KEY", "").strip()
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN_BB", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+API_KEY = os.getenv("THEODDS_API_KEY", "0bd5f7e7d785e40ecea62fac8d4f68b8").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN_BB", "8524633966:AAErsucc8BLpwBK6RtdSIXXOctF09ti_7F8").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1243807983").strip()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "bbbeast123").strip()
 
 
 def _f(name, default):
